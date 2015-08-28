@@ -18,7 +18,6 @@
 /* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER        */
 /* DEALINGS IN THE SOFTWARE.                                                  */
 
-#include <tiffio.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,49 +25,14 @@
 #include <stdio.h>
 #include <math.h>
 
-#include "gray.h"
-#include "sRGB.h"
+#include "envremap.h"
 
-/*----------------------------------------------------------------------------*/
-
-/* In image structure represents an input or output raster.                   */
-
-struct image
-{
-    float *p;  // data
-    int    h;  // height
-    int    w;  // width
-    int    c;  // sample count
-    int    b;  // sample depth
-    int    s;  // sample format
-};
-
-typedef struct image image;
-
-/* A pattern structure represents a supersampling pattern.                    */
-
-struct point
-{
-    float i;
-    float j;
-};
-
-typedef struct point point;
-
-struct pattern
-{
-    int    n;
-    point *p;
-};
-
-typedef struct pattern pattern;
-
-/*----------------------------------------------------------------------------*/
-
-typedef void (*filter)(const image *, float, float, float *);
-
-typedef int (*to_img)(int *, float *, float *, int, int, const float *);
-typedef int (*to_env)(int,   float,   float,   int, int,       float *);
+#define SAMPLEFORMAT_UINT 1
+#define SAMPLEFORMAT_INT 2
+#define SAMPLEFORMAT_IEEEFP 3
+#define SAMPLEFORMAT_VOID 4
+#define SAMPLEFORMAT_COMPLEXINT 5
+#define SAMPLEFORMAT_COMPLEXIEEEFP 6
 
 /*----------------------------------------------------------------------------*/
 /* A small set of single precision mathematical utilities.                    */
@@ -102,7 +66,7 @@ static inline void normalize(float *v)
     v[2] *= k;
 }
 
-static inline void add(float *a, const float *b, const float *c)
+inline void add(float *a, const float *b, const float *c)
 {
     a[0] = b[0] + c[0];
     a[1] = b[1] + c[1];
@@ -135,253 +99,6 @@ static void line(void *dst, int dw, int dx, int dy, int ddx, int ddy,
                                                                      c * b);
 }
 #endif
-/*----------------------------------------------------------------------------*/
-
-/* Read one scanline from the given TIFF file, converting it from the format */
-/* of the TIFF to float. The file must have contiguous planar configuration.  */
-/* This is a drop-in replacement for TIFFReadScanline.                        */
-
-int TIFFReadFloatScanline(TIFF *T, float *dst, uint32 r)
-{
-    static tdata_t *src = NULL;
-    static tsize_t  len = 0;
-
-    uint32 w = 0;
-    uint16 c = 0;
-    uint16 b = 0;
-    uint16 s = 0;
-    uint16 p = 0;
-
-    TIFFGetField(T, TIFFTAG_IMAGEWIDTH,      &w);
-    TIFFGetField(T, TIFFTAG_SAMPLESPERPIXEL, &c);
-    TIFFGetField(T, TIFFTAG_BITSPERSAMPLE,   &b);
-    TIFFGetField(T, TIFFTAG_SAMPLEFORMAT,    &s);
-    TIFFGetField(T, TIFFTAG_PLANARCONFIG,    &p);
-
-    if (p == PLANARCONFIG_CONTIG)
-    {
-        if (len != TIFFScanlineSize(T))
-        {
-            len  = TIFFScanlineSize(T);
-            src  = realloc(src, len);
-        }
-
-        if (src && TIFFReadScanline(T, src, r, 0) > 0)
-        {
-            if      ((b ==  8) && (s == SAMPLEFORMAT_UINT || s == 0))
-                for (uint32 i = 0; i < w * c; i++)
-                    dst[i] = ((uint8  *) src)[i] / 255.0f;
-
-            else if ((b ==  8) && (s == SAMPLEFORMAT_INT))
-                for (uint32 i = 0; i < w * c; i++)
-                    dst[i] = ((int8   *) src)[i] / 127.0f;
-
-            else if ((b == 16) && (s == SAMPLEFORMAT_UINT || s == 0))
-                for (uint32 i = 0; i < w * c; i++)
-                    dst[i] = ((uint16 *) src)[i] / 65535.0f;
-
-            else if ((b == 16) && (s == SAMPLEFORMAT_INT))
-                for (uint32 i = 0; i < w * c; i++)
-                    dst[i] = ((int16  *) src)[i] / 32767.0f;
-
-            else if ((b == 32) && (s == SAMPLEFORMAT_IEEEFP))
-                for (uint32 i = 0; i < w * c; i++)
-                    dst[i] = ((float  *) src)[i];
-
-            else return -1;
-        }
-    }
-    return +1;
-}
-
-/* Write one scanline to the given TIFF file, converting it from float to the */
-/* format of the TIFF. The file must have contiguous planar configuration.    */
-/* This is a drop-in replacement for TIFFWriteScanline.                       */
-
-int TIFFWriteFloatScanline(TIFF *T, float *src, uint32 r)
-{
-    static tdata_t *dst = NULL;
-    static tsize_t  len = 0;
-
-    uint32 w = 0;
-    uint16 c = 0;
-    uint16 b = 0;
-    uint16 s = 0;
-    uint16 p = 0;
-
-    TIFFGetField(T, TIFFTAG_IMAGEWIDTH,      &w);
-    TIFFGetField(T, TIFFTAG_SAMPLESPERPIXEL, &c);
-    TIFFGetField(T, TIFFTAG_BITSPERSAMPLE,   &b);
-    TIFFGetField(T, TIFFTAG_SAMPLEFORMAT,    &s);
-    TIFFGetField(T, TIFFTAG_PLANARCONFIG,    &p);
-
-    if (p == PLANARCONFIG_CONTIG)
-    {
-        if (len != TIFFScanlineSize(T))
-        {
-            len  = TIFFScanlineSize(T);
-            dst  = realloc(dst, len);
-        }
-
-        if (dst)
-        {
-            if      ((b ==  8) && (s == SAMPLEFORMAT_UINT || s == 0))
-                for (uint32 i = 0; i < w * c; i++)
-                    ((uint8  *) dst)[i] = clamp(src[i], 0.0f, 1.0f) * 255.0f;
-
-            else if ((b ==  8) && (s == SAMPLEFORMAT_INT))
-                for (uint32 i = 0; i < w * c; i++)
-                    ((int8   *) dst)[i] = clamp(src[i], 0.0f, 1.0f) * 127.0f;
-
-            else if ((b == 16) && (s == SAMPLEFORMAT_UINT || s == 0))
-                for (uint32 i = 0; i < w * c; i++)
-                    ((uint16 *) dst)[i] = clamp(src[i], 0.0f, 1.0f) * 65535.0f;
-
-            else if ((b == 16) && (s == SAMPLEFORMAT_INT))
-                for (uint32 i = 0; i < w * c; i++)
-                    ((int16  *) dst)[i] = clamp(src[i], 0.0f, 1.0f) * 32767.0f;
-
-            else if ((b == 32) && (s == SAMPLEFORMAT_IEEEFP))
-                for (uint32 i = 0; i < w * c; i++)
-                    ((float  *) dst)[i] = src[i];
-
-            else return -1;
-
-            if (TIFFWriteScanline(T, dst, r, 0) == -1)
-                return -1;
-        }
-    }
-    return +1;
-}
-
-/*----------------------------------------------------------------------------*/
-
-/* Allocate and initialize n image structures, each with a floating point     */
-/* pixel buffer with width w, height h, and channel count c.                  */
-
-static image *image_alloc(int n, int h, int w, int c, int b, int s)
-{
-    image *img;
-    int f;
-
-    if (s == 0)
-    {
-        if (b == 32)
-            s = SAMPLEFORMAT_IEEEFP;
-        else
-            s = SAMPLEFORMAT_UINT;
-    }
-
-    if ((img = (image *) calloc(n, sizeof (image))))
-        for (f = 0; f < n; f++)
-        {
-            img[f].p = (float *) calloc(w * h * c, sizeof (float));
-            img[f].w = w;
-            img[f].h = h;
-            img[f].c = c;
-            img[f].b = b;
-            img[f].s = s;
-        }
-
-    return img;
-}
-
-/* Release the storage for n image buffers.                                   */
-#if 0
-static void image_free(image *img, int n)
-{
-    int f;
-
-    for (f = 0; f < n; f++)
-        free(img[f].p);
-
-    free(img);
-}
-#endif
-
-/* Read and return n pages from the named TIFF image file.                    */
-
-static image *image_reader(const char *name, int n)
-{
-    image *in = 0;
-    TIFF  *T  = 0;
-    int    f;
-
-    if ((T = TIFFOpen(name, "r")))
-    {
-        if ((in = (image *) calloc(n, sizeof (image))))
-        {
-            for (f = 0; f < n; f++)
-            {
-                uint16 b, c, s = 0;
-                uint32 w, h, r;
-                float *p;
-
-                TIFFSetDirectory(T, f);
-
-                TIFFGetField(T, TIFFTAG_IMAGEWIDTH,      &w);
-                TIFFGetField(T, TIFFTAG_IMAGELENGTH,     &h);
-                TIFFGetField(T, TIFFTAG_SAMPLESPERPIXEL, &c);
-                TIFFGetField(T, TIFFTAG_BITSPERSAMPLE,   &b);
-                TIFFGetField(T, TIFFTAG_SAMPLEFORMAT,    &s);
-
-                if ((p = (float *) malloc(h * w * c * sizeof (float))))
-                {
-                    for (r = 0; r < h; ++r)
-                        TIFFReadFloatScanline(T, p + w * c * r, r);
-
-                    in[f].p = (float *) p;
-                    in[f].w = (int)     w;
-                    in[f].h = (int)     h;
-                    in[f].c = (int)     c;
-                    in[f].b = (int)     b;
-                    in[f].s = (int)     s;
-                }
-            }
-        }
-        TIFFClose(T);
-    }
-    return in;
-}
-
-/* Write n pages to the named TIFF image file.                                */
-
-static void image_writer(const char *name, image *out, int n)
-{
-    TIFF  *T = 0;
-    uint32 f, r;
-
-    if ((T = TIFFOpen(name, "w")))
-    {
-        for (f = 0; f < n; ++f)
-        {
-            TIFFSetField(T, TIFFTAG_IMAGEWIDTH,      out[f].w);
-            TIFFSetField(T, TIFFTAG_IMAGELENGTH,     out[f].h);
-            TIFFSetField(T, TIFFTAG_SAMPLESPERPIXEL, out[f].c);
-            TIFFSetField(T, TIFFTAG_BITSPERSAMPLE,   out[f].b);
-            TIFFSetField(T, TIFFTAG_SAMPLEFORMAT,    out[f].s);
-            TIFFSetField(T, TIFFTAG_ORIENTATION,     ORIENTATION_TOPLEFT);
-            TIFFSetField(T, TIFFTAG_PLANARCONFIG,    PLANARCONFIG_CONTIG);
-
-            if (out[f].c == 1)
-            {
-                TIFFSetField(T, TIFFTAG_PHOTOMETRIC,  PHOTOMETRIC_MINISBLACK);
-                TIFFSetField(T, TIFFTAG_ICCPROFILE, sizeof (grayicc), grayicc);
-            }
-            else
-            {
-                TIFFSetField(T, TIFFTAG_PHOTOMETRIC,  PHOTOMETRIC_RGB);
-                TIFFSetField(T, TIFFTAG_ICCPROFILE, sizeof (sRGBicc), sRGBicc);
-            }
-
-            for (r = 0; r < out[f].h; ++r)
-                TIFFWriteFloatScanline(T, out[f].p + out[f].w * out[f].c * r, r);
-
-            TIFFWriteDirectory(T);
-        }
-        TIFFClose(T);
-    }
-}
 
 /*----------------------------------------------------------------------------*/
 
@@ -423,57 +140,73 @@ static void border(image *a, rot rota, image *b, rot rotb, int d)
         }
 }
 
+image *image_alloc(int n, int h, int w, int c)
+{
+    image *img;
+    int f;
+    
+    if ((img = (image *) calloc(n, sizeof (image))))
+        for (f = 0; f < n; f++)
+        {
+            img[f].p = (float *) calloc(w * h * c, sizeof (float));
+            img[f].w = w;
+            img[f].h = h;
+            img[f].c = c;            
+        }
+    
+    return img;
+}
+
+
 /* Add borders to a cubemap image. Assume the given image pointer is an array */
 /* of six images. Copy each to a new sef of six images, each two pixels wider */
 /* and higher. Also copy the borders. This is necessary for correct cubemap   */
 /* sampling.                                                                  */
-
-static image *image_border(image *src)
+image *image_border(image *src)
 {
     image *dst = 0;
-
+    
     const int d = 1;
-
+    
     if ((src) && (dst = image_alloc(6, src[0].w + 2 * d,
-                                       src[0].w + 2 * d,
-                                       src[0].c,
-                                       src[0].b,
-                                       src[0].s)))
+                                    src[0].w + 2 * d,
+                                    src[0].c
+                                    )))
     {
         const int n = src[0].w;
         const int c = src[0].c;
         const int b = 4;
-
+        
         const int N = n + 2 * d;
-
+        
         /* Copy all page data. */
-
+        
         blit(dst[0].p, N, d, d, src[0].p, n, 0, 0, n, n, c, b);
         blit(dst[1].p, N, d, d, src[1].p, n, 0, 0, n, n, c, b);
         blit(dst[2].p, N, d, d, src[2].p, n, 0, 0, n, n, c, b);
         blit(dst[3].p, N, d, d, src[3].p, n, 0, 0, n, n, c, b);
         blit(dst[4].p, N, d, d, src[4].p, n, 0, 0, n, n, c, b);
         blit(dst[5].p, N, d, d, src[5].p, n, 0, 0, n, n, c, b);
-
+        
         border(dst + 0, rotN, dst + 5, rotN, d);
         border(dst + 5, rotN, dst + 1, rotN, d);
         border(dst + 1, rotN, dst + 4, rotN, d);
         border(dst + 4, rotN, dst + 0, rotN, d);
-
+        
         border(dst + 1, rotR, dst + 2, rotN, d);
         border(dst + 1, rotL, dst + 3, rotN, d);
-
+        
         border(dst + 2, rotN, dst + 0, rotL, d);
         border(dst + 3, rotN, dst + 0, rotR, d);
-
+        
         border(dst + 2, rotL, dst + 4, rotL, d);
         border(dst + 2, rotR, dst + 5, rotL, d);
         border(dst + 3, rotL, dst + 5, rotR, d);
         border(dst + 3, rotR, dst + 4, rotR, d);
-
+        
 #if 0
         /* Corner patch hack. */
-
+        
         for     (f = 0; f < 6; f++)
             for (k = 0; k < c; k++)
             {
@@ -499,7 +232,7 @@ static image *image_border(image *src)
 
 /* Sample an image at row i column j using linear interpolation.              */
 
-static void filter_linear(const image *img, float i, float j, float *p)
+void filter_linear(const image *img, float i, float j, float *p)
 {
     const float ii = clamp(i - 0.5f, 0.0f, img->h - 1.0f);
     const float jj = clamp(j - 0.5f, 0.0f, img->w - 1.0f);
@@ -521,7 +254,7 @@ static void filter_linear(const image *img, float i, float j, float *p)
 
 /* Sample an image at row i column j using nearest neighbor.                  */
 
-static void filter_nearest(const image *img, float i, float j, float *p)
+void filter_nearest(const image *img, float i, float j, float *p)
 {
     const float ii = clamp(i - 0.5f, 0.0f, img->h - 1.0f);
     const float jj = clamp(j - 0.5f, 0.0f, img->w - 1.0f);
@@ -537,7 +270,7 @@ static void filter_nearest(const image *img, float i, float j, float *p)
 
 /*----------------------------------------------------------------------------*/
 
-static int cube_to_img(int *f, float *i, float *j, int h, int w, const float *v)
+int cube_to_img(int *f, float *i, float *j, int h, int w, const float *v)
 {
     const float X = fabsf(v[0]);
     const float Y = fabsf(v[1]);
@@ -560,7 +293,7 @@ static int cube_to_img(int *f, float *i, float *j, int h, int w, const float *v)
     return 1;
 }
 
-static int dome_to_img(int *f, float *i, float *j, int h, int w, const float *v)
+int dome_to_img(int *f, float *i, float *j, int h, int w, const float *v)
 {
     if (v[1] >= 0)
     {
@@ -576,7 +309,7 @@ static int dome_to_img(int *f, float *i, float *j, int h, int w, const float *v)
     return 0;
 }
 
-static int hemi_to_img(int *f, float *i, float *j, int h, int w, const float *v)
+int hemi_to_img(int *f, float *i, float *j, int h, int w, const float *v)
 {
     if (v[2] <= 0)
     {
@@ -592,7 +325,7 @@ static int hemi_to_img(int *f, float *i, float *j, int h, int w, const float *v)
     return 0;
 }
 
-static int ball_to_img(int *f, float *i, float *j, int h, int w, const float *v)
+int ball_to_img(int *f, float *i, float *j, int h, int w, const float *v)
 {
     const float d = sqrtf(v[0] * v[0] + v[1] * v[1]);
     const float r = sinf(acosf(v[2]) * 0.5f);
@@ -604,7 +337,7 @@ static int ball_to_img(int *f, float *i, float *j, int h, int w, const float *v)
     return 1;
 }
 
-static int rect_to_img(int *f, float *i, float *j, int h, int w, const float *v)
+int rect_to_img(int *f, float *i, float *j, int h, int w, const float *v)
 {
     *f = 0;
     *i = h * (       acosf (v[1])        / PI);
@@ -615,7 +348,7 @@ static int rect_to_img(int *f, float *i, float *j, int h, int w, const float *v)
 
 /*----------------------------------------------------------------------------*/
 
-static int cube_to_env(int f, float i, float j, int h, int w, float *v)
+int cube_to_env(int f, float i, float j, int h, int w, float *v)
 {
     const int p[6][3][3] = {
         {{  0,  0, -1 }, {  0, -1,  0 }, {  1,  0,  0 }},
@@ -637,7 +370,7 @@ static int cube_to_env(int f, float i, float j, int h, int w, float *v)
     return 1;
 }
 
-static int dome_to_env(int f, float i, float j, int h, int w, float *v)
+int dome_to_env(int f, float i, float j, int h, int w, float *v)
 {
     const float y = 2.0f * i / h - 1.0f;
     const float x = 2.0f * j / w - 1.0f;
@@ -656,7 +389,7 @@ static int dome_to_env(int f, float i, float j, int h, int w, float *v)
     return 0;
 }
 
-static int hemi_to_env(int f, float i, float j, int h, int w, float *v)
+int hemi_to_env(int f, float i, float j, int h, int w, float *v)
 {
     const float y = 2.0f * i / h  - 1.0f;
     const float x = 2.0f * j / w  - 1.0f;
@@ -675,7 +408,7 @@ static int hemi_to_env(int f, float i, float j, int h, int w, float *v)
     return 0;
 }
 
-static int ball_to_env(int f, float i, float j, int h, int w, float *v)
+int ball_to_env(int f, float i, float j, int h, int w, float *v)
 {
     const float y = 2.0f * i / h  - 1.0f;
     const float x = 2.0f * j / w  - 1.0f;
@@ -694,7 +427,7 @@ static int ball_to_env(int f, float i, float j, int h, int w, float *v)
     return 0;
 }
 
-static int rect_to_env(int f, float i, float j, int h, int w, float *v)
+int rect_to_env(int f, float i, float j, int h, int w, float *v)
 {
     const float lat = PI2 - PI * i / h;
     const float lon = TAU * j / w - PI;
@@ -805,25 +538,25 @@ void process(const image   *src,
 
 /*----------------------------------------------------------------------------*/
 
-static point cent_points[] = {
+point cent_points[] = {
     { 0.5f, 0.5f },
 };
 
-static point rgss_points[] = {
+point rgss_points[] = {
     { 0.125f, 0.625f },
     { 0.375f, 0.125f },
     { 0.625f, 0.875f },
     { 0.875f, 0.375f },
 };
 
-static point box2_points[] = {
+point box2_points[] = {
     { 0.25f, 0.25f },
     { 0.25f, 0.75f },
     { 0.75f, 0.25f },
     { 0.75f, 0.75f },
 };
 
-static point box3_points[] = {
+point box3_points[] = {
     { 0.1666667f, 0.1666667f },
     { 0.1666667f, 0.5000000f },
     { 0.1666667f, 0.8333333f },
@@ -835,7 +568,7 @@ static point box3_points[] = {
     { 0.8333333f, 0.8333333f },
 };
 
-static point box4_points[] = {
+point box4_points[] = {
     { 0.125f, 0.125f },
     { 0.125f, 0.375f },
     { 0.125f, 0.625f },
@@ -854,163 +587,11 @@ static point box4_points[] = {
     { 0.875f, 0.875f },
 };
 
-static const pattern cent_pattern = {  1, cent_points };
-static const pattern rgss_pattern = {  4, rgss_points };
-static const pattern box2_pattern = {  4, box2_points };
-static const pattern box3_pattern = {  9, box3_points };
-static const pattern box4_pattern = { 16, box4_points };
+const pattern cent_pattern = {  1, cent_points };
+const pattern rgss_pattern = {  4, rgss_points };
+const pattern box2_pattern = {  4, box2_points };
+const pattern box3_pattern = {  9, box3_points };
+const pattern box4_pattern = { 16, box4_points };
 
-/*----------------------------------------------------------------------------*/
 
-static int usage(const char *exe)
-{
-    fprintf(stderr,
-            "%s [-i input] [-o output] [-p pattern] [-f filter] [-n n] src dst\n"
-            "\t-i ... Input  file type: cube, dome, hemi, ball, rect  [rect]\n"
-            "\t-o ... Output file type: cube, dome, hemi, ball, rect  [rect]\n"
-            "\t-p ... Sample pattern: cent, rgss, box2, box3, box4    [rgss]\n"
-            "\t-f ... Filter type: nearest, linear                  [linear]\n"
-            "\t-n ... Output size                                     [1024]\n",
-            exe);
-    return 0;
-}
 
-int main(int argc, char **argv)
-{
-    /* Set some default behaviors. */
-
-    const char *i = "rect";
-    const char *o = "rect";
-    const char *p = "rgss";
-    const char *f = "linear";
-
-    float rot[3] = { 0.f, 0.f, 0.f };
-
-    int n = 1024;
-    int c;
-
-    /* Parse the command line options. */
-
-    while ((c = getopt(argc, argv, "i:o:p:n:f:x:y:z:")) != -1)
-        switch (c)
-        {
-            case 'i': i      = optarg;               break;
-            case 'o': o      = optarg;               break;
-            case 'p': p      = optarg;               break;
-            case 'f': f      = optarg;               break;
-            case 'x': rot[0] = strtod(optarg, 0);    break;
-            case 'y': rot[1] = strtod(optarg, 0);    break;
-            case 'z': rot[2] = strtod(optarg, 0);    break;
-            case 'n': n      = strtol(optarg, 0, 0); break;
-
-            default: return usage(argv[0]);
-        }
-
-    int      num = 1;
-    image   *src = 0;
-    image   *dst = 0;
-    image   *tmp = 0;
-    to_img   img;
-    to_env   env;
-    filter   fil;
-
-    /* Select the sampler. */
-
-    if      (!strcmp(f, "linear"))  fil = filter_linear;
-    else if (!strcmp(f, "nearest")) fil = filter_nearest;
-    else return usage(argv[0]);
-
-    /* Read the input image. */
-
-    if (optind + 2 <= argc)
-    {
-        if      (!strcmp(i, "cube"))
-        {
-            tmp = image_reader(argv[optind], 6);
-            src = image_border(tmp);
-            img = cube_to_img;
-        }
-        else if (!strcmp(i, "dome"))
-        {
-            src = image_reader(argv[optind], 1);
-            img = dome_to_img;
-        }
-        else if (!strcmp(i, "hemi"))
-        {
-            src = image_reader(argv[optind], 1);
-            img = hemi_to_img;
-        }
-        else if (!strcmp(i, "ball"))
-        {
-            src = image_reader(argv[optind], 1);
-            img = ball_to_img;
-        }
-        else if (!strcmp(i, "rect"))
-        {
-            src = image_reader(argv[optind], 1);
-            img = rect_to_img;
-        }
-        else return usage(argv[0]);
-    }
-    else return usage(argv[0]);
-
-    /* Prepare the output image. */
-
-    if (src)
-    {
-        if      (!strcmp(o, "cube"))
-        {
-            dst = image_alloc((num = 6), n, n, src->c, src->b, src->s);
-            env = cube_to_env;
-        }
-        else if (!strcmp(o, "dome"))
-        {
-            dst = image_alloc((num = 1), n, n, src->c, src->b, src->s);
-            env = dome_to_env;
-        }
-        else if (!strcmp(o, "hemi"))
-        {
-            dst = image_alloc((num = 1), n, n, src->c, src->b, src->s);
-            env = hemi_to_env;
-        }
-        else if (!strcmp(o, "ball"))
-        {
-            dst = image_alloc((num = 1), n, n, src->c, src->b, src->s);
-            env = ball_to_env;
-        }
-        else if (!strcmp(o, "rect"))
-        {
-            dst = image_alloc((num = 1), n, 2 * n, src->c, src->b, src->s);
-            env = rect_to_env;
-        }
-        else return usage(argv[0]);
-    }
-
-    /* Perform the remapping using the selected pattern. */
-
-    if (src && dst)
-    {
-        if      (!strcmp(p, "cent"))
-            process(src, dst, &cent_pattern, rot, fil, img, env, num);
-
-        else if (!strcmp(p, "rgss"))
-            process(src, dst, &rgss_pattern, rot, fil, img, env, num);
-
-        else if (!strcmp(p, "box2"))
-            process(src, dst, &box2_pattern, rot, fil, img, env, num);
-
-        else if (!strcmp(p, "box3"))
-            process(src, dst, &box3_pattern, rot, fil, img, env, num);
-
-        else if (!strcmp(p, "box4"))
-            process(src, dst, &box4_pattern, rot, fil, img, env, num);
-
-        else return usage(argv[0]);
-
-        /* Write the output. */
-
-        image_writer(argv[optind + 1], dst, num);
-    }
-
-    return 0;
-}
